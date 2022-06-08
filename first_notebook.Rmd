@@ -1,0 +1,248 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+First up: we load our libraries and our data:
+
+```{r}
+
+library(ggplot2)
+library(data.table)
+library(knitr)
+library(kableExtra)
+require(ordinal)
+
+
+df <- data.table(read.csv("ux_table.csv"))
+
+```
+
+Now a few fields that we'll use throughout our EDA:
+
+```{r}
+
+df$totalCompletionTime <- df$timeToCompleteA + df$timeToCompleteB + df$timeToCompleteC
+
+df$satisfaction <- ifelse( df$satisfactionWithWebsite > 0, df$satisfactionWithWebsite, ifelse(df$satisfactionWithAPS > 0, df$satisfactionWithAPS, df$satisfactionWithRepresentative))
+
+```
+
+What's our initial posited causal diagram?
+
+```{r}
+library(ggdag)
+library(ggplot2)
+
+relations <- dagify(
+  Score ~ Time,
+  Time ~ Help + Des + Prev + APS,
+  exposure = "Des",
+  outcome = "Score"
+) 
+
+tr <- tidy_dagitty(relations)
+
+#ggdag(relations)
+
+tr <- dplyr::mutate(tr, color = ifelse(name == "Score", "Outcomes", "Variables"))
+
+
+tr %>%
+  node_parents("Score") %>%
+  node_children("Help") %>%
+  ggplot(aes(x = x, y = y, xend = xend, yend = yend, color = color)) +
+    geom_dag_point() +
+    geom_dag_edges() +
+    geom_dag_text(col = "white") +
+    theme_dag() +
+    png("first_dag.png", width=3000, height=2000, res = 600) #output to png so it looks better
+
+```
+
+What's our completion time look like?
+
+```{r}
+completionTimes <- df[startedOnWebsite == 1, mean(totalCompletionTime), redesign]
+knitr::kable( completionTimes[order(redesign)], "html", col.names = c("Redesigns", "Completion Time"), align = "cc", caption = "Total Completion Time By Number of Redesigned Tasks") %>% kable_styling()
+```
+
+Group by number of redesigns, split by previous user or not, completion times look any better?
+
+```{r}
+
+webusers <- df[df$satisfactionWithWebsite > 0,
+               avgCompletion := mean(totalCompletionTime), 
+               by=.(redesign, previousWebsiteUser)]
+
+webusers <- na.omit (webusers, "avgCompletion") 
+
+useStats <- webusers[, setdiff(names(webusers), c("avgCompletion", "redesign", "previousWebsiteUser")) := NULL][]
+useStats <- useStats[!duplicated(useStats[, c("redesign", "previousWebsiteUser"),])]
+
+setorder(useStats, cols = "redesign", "previousWebsiteUser")
+ggplot(useStats, 
+       aes(x=redesign, y=avgCompletion, fill=factor(redesign))
+       ) + 
+  geom_bar(aes(y = avgCompletion, fill = factor(..x..)), stat = "identity") +
+  facet_grid (useStats$previousWebsiteUser) + 
+  xlab("Number of Redesigns") + 
+  ylab("Completion Times") +
+  ggtitle("Change in completion time for Previous Users and New Users")
+
+```
+
+How about times for previous site users?
+
+```{r}
+
+ggplot(df[previousWebsiteUser == 1 & redesign == 0,], 
+       aes(x=totalCompletionTime)
+       ) + 
+  geom_histogram(aes(y =..count..), fill = "blue", colour="white", bins = 30) +
+  xlab("Completion Times") + 
+  ylab("Number of Users") +
+  ggtitle("Previous Users With No Redesign")
+
+
+```
+
+Now we can look at how new users differ from previous users when there's 3 redesigns:
+
+```{r}
+
+min(df$timeToCompleteA)
+
+ggplot(df[redesign == 3,], 
+       aes(x=totalCompletionTime)
+       ) + 
+  geom_histogram(aes(y = (..count..)/sum(..count..)), bins = 20, fill = "blue", colour="white",) +
+  facet_grid (df[redesign == 3,]$previousWebsiteUser) + 
+  xlab("Completion Times") + 
+  ylab("Number of Users") +
+  ggtitle("Distribution of completion times for Previous Users and New Users")
+
+
+```
+
+
+How's our user satisfaction?
+
+
+```{r}
+ggplot(df[df$satisfactionWithWebsite > 0,], aes(x=satisfactionWithWebsite, fill="blue")) +
+                        geom_bar(aes(y = ..prop..), stat="count") +
+                        ylab("Rating by Percentage of Users")
+```
+
+Not great!
+
+How about the satisfaction between new users and previous users?
+
+
+```{r}
+ggplot(df[df$satisfactionWithWebsite > 0,], aes(x=satisfactionWithWebsite, fill=previousWebsiteUser)) +
+                        theme(legend.position = "right") +
+                        geom_bar(aes(y = ..prop.., fill = factor(previousWebsiteUser)), stat="count", position="dodge") +
+                        scale_x_discrete(breaks=seq(1, 5, 1))
+
+```
+
+Are they statistically significant?
+
+```{r}
+ks.test(df[df$previousWebsiteUser == 1,]$satisfactionWithWebsite, df[df$previousWebsiteUser == 0,]$satisfactionWithWebsite)
+```
+
+How about a distribution of ratings based on number of redesigns?
+
+```{r}
+ggplot(df[df$startedOnWebsite == 1 & df$satisfactionWithWebsite > 0,], 
+       aes(x=df[df$startedOnWebsite == 1  & df$satisfactionWithWebsite > 0,]$satisfactionWithWebsite,
+           fill=df[df$startedOnWebsite == 1  & df$satisfactionWithWebsite > 0,]$satisfactionWithWebsite)
+       ) + 
+  geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat="count") + 
+  scale_x_discrete(labels=scales::percent) +
+  facet_grid (df[df$startedOnWebsite ==  1 & df$satisfactionWithWebsite > 0,]$redesign) + 
+  xlab("Number of Redesigns") + 
+  ylab("Distribution of Ratings") + 
+  coord_flip() + 
+  scale_fill_discrete("Rating")
+```
+
+
+How about a correlation matrix?
+
+```{r}
+
+library(corrplot)
+library(ggcorrplot)
+
+cor.mtest <- function(mat, ...) {
+    mat <- as.matrix(mat)
+    n <- ncol(mat)
+    p.mat<- matrix(NA, n, n)
+    diag(p.mat) <- 0
+    for (i in 1:(n - 1)) {
+        for (j in (i + 1):n) {
+            tmp <- cor.test(mat[, i], mat[, j], ...)
+            p.mat[i, j] <- p.mat[j, i] <- tmp$p.value
+        }
+    }
+  colnames(p.mat) <- rownames(p.mat) <- colnames(mat)
+  p.mat
+}
+
+p.mat <- cor.mtest(df[,c("redesign", "previousWebsiteUser", "totalCompletionTime", "transferredToAPS", "satisfactionWithWebsite", "usedHelp"),])
+
+corr <- cor(df[,c("redesign", "previousWebsiteUser", "totalCompletionTime", "transferredToAPS", "satisfactionWithWebsite", "usedHelp"),])
+col <- colorRampPalette(c("#BB4444", "#EE9988", "#FFFFFF", "#77AADD", "#4477AA"))
+
+corrplot(corr, method="color", col=col(200),  
+          type="upper", order="hclust", 
+         addCoef.col = "black", # Add coefficient of correlation
+         tl.col="black", tl.srt=45, #Text label color and rotation
+         # Combine with significance
+         p.mat = p.mat, sig.level = 0.01, insig = "blank", 
+         # hide correlation coefficient on the principal diagonal
+         diag=FALSE 
+         )
+
+```
+
+Let's update our DAG
+
+```{r}
+
+relations <- dagify(
+  Score ~ Help + Prev + Time,
+  Help ~ Des + Prev,
+  APS ~ Des + Help + Time,
+  exposure = "Des"
+) 
+
+tr <- tidy_dagitty(relations)
+
+tr <- dplyr::mutate(tr, color = ifelse(name == "Score" | name == "APS", "Outcomes", "Variables"))
+
+tr %>%
+  node_parents("Help") %>% node_parents("Des") %>%
+  node_children("APS") %>% node_children("Score") %>%
+  ggplot(aes(x = x, y = y, xend = xend, yend = yend, color=color)) +
+    geom_dag_point() +
+    geom_dag_edges() +
+    geom_dag_text(col = "white") +
+    theme_dag() +
+    png("second_dag.png", width=3000, height=2000, res = 600)
+
+```
+
+Now to make a model:
+
+
+```{r}
+
+satisfactionModel <- lm( satisfactionWithWebsite ~ usedHelp * redesign + as.factor(previousWebsiteUser), df[satisfactionWithWebsite > 0,] )
+summary(satisfactionModel)
+
+```
