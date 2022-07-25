@@ -1,0 +1,235 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(ggplot2)
+library(data.table)
+library(knitr)
+library(kableExtra)
+library(ordinal)
+library(MASS)
+library(DescTools)
+library(rcompanion)
+library(lmtest)
+library(flexmix)
+library(diptest)
+
+df <- data.table(read.csv("ux_table.csv"))
+
+```
+
+First, let's engineer some features!
+
+```{r}
+df$totalCompletionTime <- df$timeToCompleteA + df$timeToCompleteB + df$timeToCompleteC
+
+df$satisfaction <- ifelse( df$satisfactionWithWebsite > 0, df$satisfactionWithWebsite, ifelse(df$satisfactionWithAPS > 0, df$satisfactionWithAPS, df$satisfactionWithRepresentative))
+
+df$satisfactionBin <- ifelse( df$satisfaction > 3, 1, 0)
+
+```
+
+Do we have multimodality?
+
+```{r}
+dip.test(df$satisfaction)
+```
+
+Where are our two modes?
+
+```{r}
+library(BSDA)
+dstamp <- density(df$satisfaction, bw=1, kernel = "gaussian")
+chng <- cumsum(rle(sign(diff(dstamp$y)))$lengths)
+plot(dstamp, main="Detected Modes of Ratings")
+abline(v = dstamp$x[chng[seq(1,length(chng),2)]])
+```
+
+One more check for multimodality:
+
+```{r}
+library(LaplacesDemon)
+is.multimodal(df$satisfaction)
+```
+
+Let's take a look at the satisfaction based on redesign and help
+
+```{r}
+
+library(lattice)
+
+histogram(~ satisfaction | redesign,
+          data=df,
+          layout=c(1,4)      #  columns and rows of individual plots
+          )
+
+```
+
+Let's try a cumulative link model. Does it do any better?
+
+```{r}
+
+### build the cumulative link model
+m <- clm(as.factor(satisfactionBin) ~ as.factor(usedHelp) + as.factor(redesign), 
+         data = df[satisfactionWithWebsite > 0,], 
+         Hess=TRUE)
+
+### view a summary of the model
+summary(m)
+
+### get the coefficients
+(ctable <- coef(summary(m)))
+
+### confint
+ci <- confint(m)
+```
+
+```{r}
+
+
+### build a null model
+model.null <- clm(as.factor(satisfactionWithWebsite) ~ 1, data = df[satisfactionWithWebsite > 0,])
+
+### now anova it and see if our model is better than a blank model
+anova(m, model.null)
+
+### now how does our model do against an empty model?
+print(1 - m$logLik/model.null$logLik )
+
+
+```
+So we're onto something in our satisfaction, but that doesn't express that satisfaction AND transferring express ease of use.
+
+Let's get into the LCA and look at our classes for people who had no redesigns.
+
+
+```{r}
+
+library(poLCA)
+
+#requires recoding
+polca_recode <- df[startedOnWebsite == 1 & transferredToRep == 0,]
+polca_recode$transferredToAPS <- 2 - polca_recode$transferredToAPS
+polca_recode$redesign <- polca_recode$redesign + 1
+polca_recode$usedHelp <- polca_recode$usedHelp + 1
+polca_recode$previousWebsiteUser <- polca_recode$previousWebsiteUser + 1
+
+no_redesign <- poLCA(
+                cbind(satisfaction, transferredToAPS, usedHelp) ~ 1,
+                nclass=2,
+                data=polca_recode[redesign == 1,],
+                nrep=1,
+                na.rm=F,
+                graphs=T,
+                maxiter = 100000
+             )
+
+```
+
+Now let's look at our classes for people who had all the redesigns.
+
+
+```{r}
+redesign_mod <- poLCA(
+                cbind(satisfaction, transferredToAPS, usedHelp) ~ 1,
+                nclass=2,
+                data=polca_recode[redesign == 4,],
+                nrep=1,
+                na.rm=F,
+                graphs=T,
+                maxiter = 100000
+             )
+
+```
+
+Let's make a few poLCA objects with multiple classes to make sure 2 captures it correctly:
+
+```{r}
+
+polca_all2 <- poLCA(
+                cbind(satisfaction, transferredToAPS, usedHelp, redesign) ~ 1,
+                nclass=2,
+                data=polca_recode,
+                nrep=1,
+                na.rm=F,
+                graphs=F,
+                maxiter = 100000
+             )
+
+polca_all3 <- poLCA(
+                cbind(satisfaction, transferredToAPS, usedHelp, redesign) ~ 1,
+                nclass=3,
+                data=polca_recode,
+                nrep=1,
+                na.rm=F,
+                graphs=F,
+                maxiter = 100000
+             )
+
+polca_all4 <- poLCA(
+                cbind(satisfaction, transferredToAPS, usedHelp, redesign) ~ 1,
+                nclass=4,
+                data=polca_recode,
+                nrep=1,
+                na.rm=F,
+                graphs=F,
+                maxiter = 100000
+             )
+
+
+
+polca_entropy <- function (p) sum( -p * log(p) )
+
+error_prior <- polca_entropy(polca_all2$P) # class proportions model 2
+error_post <- mean(apply(polca_all2$posterior,1, polca_entropy), na.rm = TRUE)
+
+round(((error_prior-error_post) / error_prior),3)
+
+error_prior <- polca_entropy(polca_all3$P) # class proportions model 2
+error_post <- mean(apply(polca_all3$posterior,1, polca_entropy), na.rm = TRUE)
+
+round(((error_prior-error_post) / error_prior),3)
+
+error_prior <- polca_entropy(polca_all4$P) # class proportions model 2
+error_post <- mean(apply(polca_all4$posterior,1, polca_entropy), na.rm = TRUE)
+
+round(((error_prior-error_post) / error_prior),3)
+
+
+```
+
+```{r}
+polca_all <- poLCA(
+                cbind(satisfaction, transferredToAPS, usedHelp) ~ redesign,
+                nclass=2,
+                data=polca_recode,
+                nrep=1,
+                na.rm=F,
+                graphs=F,
+                maxiter = 100000
+             )
+
+
+```
+
+
+
+```{r}
+redesign_mat <- cbind(1,c(1:4))
+exb <- exp(redesign_mat %*% polca_all$coeff)
+class_likelihoods <- (cbind(1,exb) / (1+rowSums(exb)))
+
+lca_df <- data.frame(
+  redesigns=c(c(1:4),c(1:4)), 
+  class=c(rep(1,4),rep(2,4)), 
+  likelihood=c(class_likelihoods[,1], class_likelihoods[,2])
+)
+
+ggplot(data=lca_df, aes(x=redesigns, y=likelihood, group=as.factor(class))) +
+  geom_line(aes(color=as.factor(class))) +
+  geom_point(aes(color=as.factor(class))) +
+  labs(x="Number of Redesigns", y="Likelihood of Latent Class Membership") +
+  scale_color_discrete(name="Latent Classes", labels=c('Ease of use: no', 'Ease of use: yes'))
+```
